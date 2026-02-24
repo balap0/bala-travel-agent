@@ -1,0 +1,27 @@
+# Dependencies (installed in Docker build)
+backend/venv/
+frontend/node_modules/
+
+# Build artifacts
+frontend/dist/
+
+# Data files
+backend/data/
+
+# Environment files (set via Railway env vars)
+.env
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+__pycache__/
+*.pyc
+.DS_Store
+*.md
+.claude/
