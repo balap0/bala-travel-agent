@@ -4,7 +4,20 @@
 import aiosqlite
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime
+
+
+class _DateEncoder(json.JSONEncoder):
+    """JSON encoder that handles date/datetime objects from Pydantic models."""
+    def default(self, obj):
+        if isinstance(obj, (date, datetime)):
+            return obj.isoformat()
+        return super().default(obj)
+
+
+def _dumps(obj):
+    """JSON serialize with date support."""
+    return json.dumps(obj, cls=_DateEncoder)
 
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "sessions.db")
@@ -45,13 +58,13 @@ async def save_session(session_id: str, parsed_query: dict = None,
             params = [now]
             if parsed_query is not None:
                 updates.append("parsed_query = ?")
-                params.append(json.dumps(parsed_query))
+                params.append(_dumps(parsed_query))
             if conversation is not None:
                 updates.append("conversation_history = ?")
-                params.append(json.dumps(conversation))
+                params.append(_dumps(conversation))
             if results is not None:
                 updates.append("last_results = ?")
-                params.append(json.dumps(results))
+                params.append(_dumps(results))
             params.append(session_id)
 
             await db.execute(
@@ -65,9 +78,9 @@ async def save_session(session_id: str, parsed_query: dict = None,
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, now, now,
-                    json.dumps(parsed_query) if parsed_query else None,
-                    json.dumps(conversation or []),
-                    json.dumps(results) if results else None,
+                    _dumps(parsed_query) if parsed_query else None,
+                    _dumps(conversation or []),
+                    _dumps(results) if results else None,
                 )
             )
         await db.commit()

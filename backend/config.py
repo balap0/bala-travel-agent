@@ -1,11 +1,29 @@
 # Configuration management — loads settings from environment variables
+# Uses python-dotenv to load .env, then pydantic-settings for validation
 
-from pydantic_settings import BaseSettings
+import os
+from pathlib import Path
 from functools import lru_cache
+
+from dotenv import load_dotenv
+from pydantic_settings import BaseSettings
+
+# Load .env file before pydantic-settings reads os.environ
+_env_path = Path(__file__).parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path, override=True)
+
+# Fix SSL certificates on macOS (Amadeus SDK needs this)
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except ImportError:
+    pass
 
 
 class Settings(BaseSettings):
-    """App settings loaded from environment variables or .env file."""
+    """App settings loaded from environment variables."""
 
     # Amadeus API
     amadeus_client_id: str = ""
@@ -28,11 +46,6 @@ class Settings(BaseSettings):
 
     # Claude model to use
     claude_model: str = "claude-sonnet-4-20250514"
-
-    model_config = {
-        "env_file": "../.env",
-        "env_file_encoding": "utf-8",
-    }
 
 
 @lru_cache()
