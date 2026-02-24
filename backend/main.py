@@ -54,24 +54,6 @@ async def health_check():
     }
 
 
-@app.get("/api/debug/env")
-async def debug_env():
-    """Temporary debug endpoint — shows masked API key info to diagnose env issues."""
-    raw = os.environ.get("ANTHROPIC_API_KEY", "")
-    from_settings = settings.anthropic_api_key
-    return {
-        "raw_env_length": len(raw),
-        "raw_env_first10": raw[:10] if raw else "",
-        "raw_env_last10": raw[-10:] if raw else "",
-        "raw_env_has_double_underscore": "__" in raw,
-        "settings_length": len(from_settings),
-        "settings_first10": from_settings[:10] if from_settings else "",
-        "settings_last10": from_settings[-10:] if from_settings else "",
-        "settings_has_double_underscore": "__" in from_settings,
-        "match": raw == from_settings,
-    }
-
-
 # Serve frontend static build in production
 frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.isdir(frontend_dist):
