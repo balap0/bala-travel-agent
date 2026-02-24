@@ -16,6 +16,7 @@ type ViewState = 'idle' | 'searching' | 'parsing' | 'results' | 'refining' | 'er
 
 export default function SearchPage({ token, onLogout }: SearchPageProps) {
   const [viewState, setViewState] = useState<ViewState>('idle')
+  const [isRefining, setIsRefining] = useState(false)
   const [searchResponse, setSearchResponse] = useState<SearchResponse | null>(null)
   const [error, setError] = useState('')
 
@@ -39,7 +40,7 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
 
   const handleRefine = async (message: string) => {
     if (!searchResponse) return
-    setViewState('refining')
+    setIsRefining(true)
 
     try {
       const response = await api.refine(searchResponse.session_id, message, token)
@@ -50,10 +51,11 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
           parsed_query: response.updated_query || searchResponse.parsed_query,
         })
       }
-      setViewState('results')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Refinement failed')
       setViewState('error')
+    } finally {
+      setIsRefining(false)
     }
   }
 
@@ -75,7 +77,7 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
         {/* Search input — always visible */}
         <SearchInput
           onSearch={handleSearch}
-          loading={viewState === 'searching' || viewState === 'refining'}
+          loading={viewState === 'searching' || isRefining}
         />
 
         {/* Status messages */}
@@ -107,7 +109,7 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
 
             <ResultsList results={searchResponse.results} />
 
-            <RefineInput onRefine={handleRefine} loading={viewState === 'refining'} />
+            <RefineInput onRefine={handleRefine} loading={isRefining} />
           </>
         )}
 
