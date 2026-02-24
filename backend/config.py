@@ -25,6 +25,9 @@ except ImportError:
 class Settings(BaseSettings):
     """App settings loaded from environment variables."""
 
+    # Disable __ as nested model separator — our API keys contain literal __
+    model_config = {"env_nested_delimiter": None}
+
     # Amadeus API
     amadeus_client_id: str = ""
     amadeus_client_secret: str = ""
