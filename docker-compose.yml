@@ -1,0 +1,24 @@
+# Local development — runs backend and frontend with hot reload
+# Usage: docker-compose up --build
+
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=development
+    volumes:
+      - ./backend:/app/backend
+      - backend-data:/app/backend/data
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    working_dir: /app/backend
+
+volumes:
+  backend-data:

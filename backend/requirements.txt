@@ -1,0 +1,33 @@
+# Core framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Amadeus flight search
+amadeus==9.0.0
+
+# Anthropic Claude AI
+anthropic==0.43.0
+
+# SerpAPI Google Flights
+google-search-results==2.4.2
+
+# Auth & sessions
+python-jose[cryptography]==3.3.0
+passlib==1.7.4
+
+# Database (SQLite async)
+aiosqlite==0.20.0
+
+# HTTP client
+httpx==0.28.1
+
+# Environment
+python-dotenv==1.0.1
+pydantic-settings==2.7.1
+
+# CORS
+# (included in FastAPI/Starlette)
+
+# Dev/test
+pytest==8.3.4
+pytest-asyncio==0.24.0
