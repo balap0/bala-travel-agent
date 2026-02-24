@@ -25,9 +25,6 @@ except ImportError:
 class Settings(BaseSettings):
     """App settings loaded from environment variables."""
 
-    # Disable __ as nested model separator — our API keys contain literal __
-    model_config = {"env_nested_delimiter": None}
-
     # Amadeus API
     amadeus_client_id: str = ""
     amadeus_client_secret: str = ""
@@ -35,7 +32,7 @@ class Settings(BaseSettings):
     # SerpAPI
     serpapi_api_key: str = ""
 
-    # Anthropic
+    # Anthropic — read directly from os.environ to avoid __ mangling
     anthropic_api_key: str = ""
 
     # App auth
@@ -54,4 +51,10 @@ class Settings(BaseSettings):
 @lru_cache()
 def get_settings() -> Settings:
     """Cached settings singleton."""
-    return Settings()
+    s = Settings()
+    # Pydantic-settings treats __ as a nested model separator, which corrupts
+    # API keys containing literal __ (like Anthropic keys). Read it directly.
+    raw_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if raw_key and raw_key != s.anthropic_api_key:
+        s = s.model_copy(update={"anthropic_api_key": raw_key})
+    return s
