@@ -22,6 +22,8 @@ from providers.amadeus_provider import AmadeusProvider
 from providers.serpapi_provider import SerpAPIProvider
 from search.strategies.direct import DirectSearchStrategy
 from search.strategies.hub_based import HubBasedSearchStrategy
+from learning.interaction_logger import interaction_logger
+from learning.preferences import preferences_manager
 
 logger = logging.getLogger(__name__)
 search_router = APIRouter()
@@ -108,11 +110,14 @@ async def _run_pipeline(request: SearchRequest):
     start_time = time.time()
     session_id = request.session_id or str(uuid.uuid4())
 
+    # --- Load user preferences for prompt injection ---
+    pref_context = preferences_manager.to_prompt_context()
+
     # --- Step 1: Parse natural language query ---
     yield ("thinking", "Understanding your request...")
 
     try:
-        parsed_dict = await claude_client.parse_query(request.query)
+        parsed_dict = await claude_client.parse_query(request.query, preferences_context=pref_context)
         parsed_query = ParsedQuery(**parsed_dict)
     except Exception as e:
         logger.error(f"Query parsing failed: {e}")
@@ -121,6 +126,9 @@ async def _run_pipeline(request: SearchRequest):
 
     yield ("thinking", f"Got it — {parsed_query.origin} → {parsed_query.destination}, "
            f"{parsed_query.departure_date}, {parsed_query.cabin_class}")
+
+    # Log the parsed search
+    await interaction_logger.log_search(session_id, request.query, parsed_dict)
 
     # Check if Claude needs clarification from the parse step
     if parsed_query.clarification_needed:
@@ -140,7 +148,8 @@ async def _run_pipeline(request: SearchRequest):
 
     try:
         analysis_dict = await claude_client.analyze_route(
-            parsed_query.origin, parsed_query.destination, parsed_query.preferences
+            parsed_query.origin, parsed_query.destination, parsed_query.preferences,
+            preferences_context=pref_context,
         )
         route_analysis = RouteAnalysis(**analysis_dict)
     except Exception as e:
@@ -150,6 +159,9 @@ async def _run_pipeline(request: SearchRequest):
             strategy="direct_search",
             reasoning="Defaulting to direct search.",
         )
+
+    # Log route analysis
+    await interaction_logger.log_route_analysis(session_id, route_analysis.model_dump())
 
     # Send route analysis to client
     yield ("strategy", route_analysis.reasoning)
@@ -176,6 +188,16 @@ async def _run_pipeline(request: SearchRequest):
             yield (event_type, message)
 
     sources_used = list({f.source for f in all_flights})
+
+    # Log search results summary
+    search_duration = round(time.time() - start_time, 2)
+    price_range = None
+    if all_flights:
+        prices = [f.price_usd for f in all_flights]
+        price_range = (min(prices), max(prices))
+    await interaction_logger.log_results(
+        session_id, len(all_flights), sources_used, search_duration, price_range
+    )
 
     # --- Step 4: Handle no results ---
     if not all_flights:
@@ -205,6 +227,7 @@ async def _run_pipeline(request: SearchRequest):
             parsed_query.model_dump(),
             flights_as_dicts,
             parsed_query.preferences,
+            preferences_context=pref_context,
         )
     except Exception as e:
         logger.error(f"Ranking failed: {e}")
@@ -233,6 +256,11 @@ async def _run_pipeline(request: SearchRequest):
             explanation=ranking.get("explanation", ""),
             tags=ranking.get("tags", []),
         ))
+
+    # Log ranking results
+    await interaction_logger.log_ranking(
+        session_id, [r.model_dump() for r in ranked_results]
+    )
 
     # --- Step 8: Save session ---
     conversation = [{"role": "user", "content": request.query}]
@@ -286,12 +314,14 @@ async def refine_search(
 
     current_query = session.get("parsed_query", {})
     conversation = session.get("conversation_history", [])
+    pref_context = preferences_manager.to_prompt_context()
 
     try:
         result = await claude_client.handle_refinement(
             conversation_history=conversation,
             refinement_message=request.message,
             current_query=current_query,
+            preferences_context=pref_context,
         )
     except Exception as e:
         logger.error(f"Refinement failed: {e}")
@@ -304,6 +334,15 @@ async def refine_search(
         session_id=session_id,
         message=result.get("message", ""),
     )
+
+    # Ambient preference detection — if Claude found a preference in the refinement
+    pref_detected = result.get("preference_detected")
+    if pref_detected and isinstance(pref_detected, dict):
+        content = pref_detected.get("content", "")
+        category = pref_detected.get("category", "soft_preference")
+        if content:
+            await preferences_manager.add(content, category, "explicit", session_id)
+            response.message += f" (Remembered for future searches: \"{content}\")"
 
     if result.get("needs_new_search") and result.get("updated_query"):
         try:
@@ -344,6 +383,11 @@ async def refine_search(
         except Exception as e:
             logger.error(f"Refined search failed: {e}")
             response.message += " (Search with updated params failed, showing previous results.)"
+
+    # Log the refinement
+    await interaction_logger.log_refinement(
+        session_id, request.message, bool(result.get("needs_new_search"))
+    )
 
     conversation.append({"role": "user", "content": request.message})
     conversation.append({"role": "assistant", "content": result.get("message", "")})

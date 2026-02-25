@@ -29,7 +29,14 @@ class ClaudeClient:
             self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         return self._client
 
-    async def parse_query(self, natural_language_query: str) -> dict:
+    def _inject_preferences(self, base_prompt: str, preferences_context: str = "") -> str:
+        """Append user preferences to a system prompt if they exist."""
+        if preferences_context:
+            return base_prompt + "\n" + preferences_context
+        return base_prompt
+
+    async def parse_query(self, natural_language_query: str,
+                          preferences_context: str = "") -> dict:
         """
         Parse a natural language travel query into structured search params.
         Returns a dict matching the ParsedQuery schema fields.
@@ -40,13 +47,14 @@ class ClaudeClient:
         """
         settings = get_settings()
         client = self._get_client()
+        system_prompt = self._inject_preferences(PARSE_SYSTEM_PROMPT, preferences_context)
 
         try:
             response = await asyncio.to_thread(
                 client.messages.create,
                 model=settings.claude_model,
                 max_tokens=1024,
-                system=PARSE_SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[
                     {"role": "user", "content": natural_language_query}
                 ],
@@ -76,7 +84,8 @@ class ClaudeClient:
             raise
 
     async def analyze_route(self, origin: str, destination: str,
-                            preferences: list[str] = None) -> dict:
+                            preferences: list[str] = None,
+                            preferences_context: str = "") -> dict:
         """
         Analyze a route to determine search strategy before any flight API calls.
         Returns a dict matching the RouteAnalysis schema.
@@ -96,11 +105,12 @@ class ClaudeClient:
         })
 
         try:
+            system_prompt = self._inject_preferences(ROUTE_ANALYSIS_PROMPT, preferences_context)
             response = await asyncio.to_thread(
                 client.messages.create,
                 model=settings.claude_model,
                 max_tokens=1024,
-                system=ROUTE_ANALYSIS_PROMPT,
+                system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_message}
                 ],
@@ -145,7 +155,8 @@ class ClaudeClient:
             }
 
     async def rank_results(self, parsed_query: dict, flights: list[dict],
-                           preferences: list[str]) -> list[dict]:
+                           preferences: list[str],
+                           preferences_context: str = "") -> list[dict]:
         """
         Rank flight results and generate natural language explanations.
         Returns a list of dicts with: rank, explanation, tags, flight_id.
@@ -200,11 +211,12 @@ class ClaudeClient:
         }, indent=2)
 
         try:
+            system_prompt = self._inject_preferences(RANK_SYSTEM_PROMPT, preferences_context)
             response = await asyncio.to_thread(
                 client.messages.create,
                 model=settings.claude_model,
                 max_tokens=2048,
-                system=RANK_SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_message}
                 ],
@@ -246,7 +258,8 @@ class ClaudeClient:
 
     async def handle_refinement(self, conversation_history: list,
                                 refinement_message: str,
-                                current_query: dict) -> dict:
+                                current_query: dict,
+                                preferences_context: str = "") -> dict:
         """
         Handle conversational refinement of a search.
         Claude interprets the follow-up and determines what to change.
@@ -263,11 +276,12 @@ class ClaudeClient:
         }, indent=2)
 
         try:
+            system_prompt = self._inject_preferences(REFINE_SYSTEM_PROMPT, preferences_context)
             response = await asyncio.to_thread(
                 client.messages.create,
                 model=settings.claude_model,
                 max_tokens=1024,
-                system=REFINE_SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_message}
                 ],

@@ -107,11 +107,13 @@ Interpret their refinement and return:
 1. message: A natural language response acknowledging what you understood
 2. updated_query: The modified ParsedQuery (same schema as the original, with changes applied)
 3. needs_new_search: boolean - true if the refinement requires a new API search
+4. preference_detected: (OPTIONAL) If the user expresses a lasting preference to remember for ALL future searches, include {"content": "...", "category": "hard_constraint" | "soft_preference" | "context"}. Only include this for statements that clearly want something remembered long-term, NOT for one-time search changes.
 
 Examples:
 - "What about a day later?" → shift departure_date +1, needs_new_search=true
 - "Show me economy options" → change cabin_class to ECONOMY, needs_new_search=true
-- "Only Ethiopian Airlines" → add airline filter, needs_new_search=true
+- "Remember I never fly Air India" → preference_detected={"content": "Never fly Air India", "category": "hard_constraint"}
+- "I always prefer morning departures" → preference_detected={"content": "Prefer morning departures", "category": "soft_preference"}
 - "Why is #2 ranked above #3?" → explanation only, needs_new_search=false
 
 Return ONLY valid JSON."""

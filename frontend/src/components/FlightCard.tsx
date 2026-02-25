@@ -5,6 +5,7 @@ import { RankedResult } from '../api/client'
 
 interface FlightCardProps {
   result: RankedResult
+  onInteraction?: (action: string, flightRank: number, flightId: string) => void
 }
 
 // Format minutes to "Xh Ym"
@@ -14,7 +15,7 @@ function formatDuration(minutes: number): string {
   return m > 0 ? `${h}h ${m}m` : `${h}h`
 }
 
-export default function FlightCard({ result }: FlightCardProps) {
+export default function FlightCard({ result, onInteraction }: FlightCardProps) {
   const [expanded, setExpanded] = useState(result.rank === 1)
   const { flight, explanation, tags, rank } = result
 
@@ -80,7 +81,13 @@ export default function FlightCard({ result }: FlightCardProps) {
       {/* AI Explanation */}
       <div className="mt-3">
         <button
-          onClick={() => setExpanded(!expanded)}
+          onClick={() => {
+            const wasExpanded = expanded
+            setExpanded(!wasExpanded)
+            if (!wasExpanded) {
+              onInteraction?.('expand_reasoning', rank, flight.id)
+            }
+          }}
           className="text-sm text-brand-600 hover:text-brand-700 font-medium"
         >
           {expanded ? '▼ Hide reasoning' : '▶ Show AI reasoning'}

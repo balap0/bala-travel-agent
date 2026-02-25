@@ -6,6 +6,7 @@ import SearchInput from './SearchInput'
 import AgentThinking, { ThinkingStep } from './AgentThinking'
 import ResultsList from './ResultsList'
 import RefineInput from './RefineInput'
+import PreferencesPanel from './PreferencesPanel'
 
 interface SearchPageProps {
   token: string
@@ -21,6 +22,7 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
   const [routeAnalysis, setRouteAnalysis] = useState<RouteAnalysis | undefined>()
   const [thinkingSteps, setThinkingSteps] = useState<ThinkingStep[]>([])
   const [error, setError] = useState('')
+  const [prefsOpen, setPrefsOpen] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
 
   const addStep = useCallback((type: ThinkingStep['type'], message: string) => {
@@ -84,6 +86,15 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
     }
   }
 
+  const handleInteraction = useCallback((action: string, flightRank: number, flightId: string) => {
+    api.logInteraction({
+      session_id: searchResponse?.session_id,
+      action,
+      flight_rank: flightRank,
+      flight_id: flightId,
+    }, token)
+  }, [searchResponse?.session_id, token])
+
   const isSearching = viewState === 'searching'
 
   return (
@@ -91,12 +102,21 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
       {/* Header */}
       <header className="bg-white border-b px-4 py-3 flex items-center justify-between">
         <h1 className="text-xl font-bold text-gray-900">Bala Travel Agent</h1>
-        <button
-          onClick={onLogout}
-          className="text-sm text-gray-500 hover:text-gray-700 transition"
-        >
-          Logout
-        </button>
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => setPrefsOpen(true)}
+            className="text-sm text-gray-500 hover:text-gray-700 transition flex items-center gap-1"
+            title="My Preferences"
+          >
+            Preferences
+          </button>
+          <button
+            onClick={onLogout}
+            className="text-sm text-gray-500 hover:text-gray-700 transition"
+          >
+            Logout
+          </button>
+        </div>
       </header>
 
       {/* Main content */}
@@ -150,7 +170,7 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
               </div>
             )}
 
-            <ResultsList results={searchResponse.results} />
+            <ResultsList results={searchResponse.results} onInteraction={handleInteraction} />
 
             <RefineInput onRefine={handleRefine} loading={isRefining} />
           </>
@@ -167,6 +187,13 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
           </div>
         )}
       </main>
+
+      {/* Preferences panel */}
+      <PreferencesPanel
+        token={token}
+        isOpen={prefsOpen}
+        onClose={() => setPrefsOpen(false)}
+      />
     </div>
   )
 }

@@ -11,6 +11,8 @@ from fastapi.staticfiles import StaticFiles
 from config import get_settings
 from auth.middleware import auth_router
 from search.orchestrator import search_router
+from routes.preferences import preferences_router
+from routes.logging import log_router
 from models.database import init_db
 
 
@@ -42,6 +44,8 @@ if settings.environment == "development":
 # API routes
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(search_router, prefix="/api/search", tags=["search"])
+app.include_router(preferences_router, prefix="/api/preferences", tags=["preferences"])
+app.include_router(log_router, prefix="/api/log", tags=["logging"])
 
 
 @app.get("/api/health")

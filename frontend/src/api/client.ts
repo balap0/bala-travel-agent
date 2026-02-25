@@ -173,6 +173,38 @@ export const api = {
       body: { message },
       token,
     }),
+
+  // Interaction logging — fire-and-forget
+  logInteraction: (event: { session_id?: string; action: string; flight_rank?: number; flight_id?: string }, token: string) => {
+    fetch(`${BASE_URL}/log/interaction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(event),
+    }).catch(() => {}) // silent fail — logging should never break UX
+  },
+
+  // Preferences CRUD
+  getPreferences: (token: string) =>
+    apiCall<PreferencesData>('/preferences', { token }),
+
+  addPreference: (content: string, category: string, token: string) =>
+    apiCall<Preference>('/preferences', {
+      method: 'POST',
+      body: { content, category },
+      token,
+    }),
+
+  togglePreference: (id: string, token: string) =>
+    apiCall<Preference>(`/preferences/${id}`, {
+      method: 'PUT',
+      token,
+    }),
+
+  deletePreference: (id: string, token: string) =>
+    apiCall<{ deleted: boolean }>(`/preferences/${id}`, {
+      method: 'DELETE',
+      token,
+    }),
 }
 
 // Response types matching backend schemas
@@ -248,4 +280,19 @@ export interface RefineResponse {
   message: string
   updated_query?: ParsedQuery
   results?: RankedResult[]
+}
+
+export interface Preference {
+  id: string
+  content: string
+  category: 'hard_constraint' | 'soft_preference' | 'context'
+  source: 'explicit' | 'inferred'
+  active: boolean
+  created_at: string
+}
+
+export interface PreferencesData {
+  version: number
+  updated_at: string
+  preferences: Preference[]
 }
