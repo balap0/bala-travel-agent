@@ -40,6 +40,7 @@ export interface SSECallbacks {
   onSearching?: (message: string) => void
   onRanking?: (message: string) => void
   onResults?: (response: SearchResponse) => void
+  onWaitingForInput?: (data: { session_id: string; questions: string[]; context: string }) => void
   onError?: (error: string) => void
 }
 
@@ -69,46 +70,7 @@ export function searchWithSSE(
       callbacks.onError?.(err.detail || `HTTP ${response.status}`)
       return
     }
-
-    const reader = response.body?.getReader()
-    if (!reader) {
-      callbacks.onError?.('No response stream')
-      return
-    }
-
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let pendingEvent = ''
-    let pendingData = ''
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-
-      // Parse SSE events from buffer
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || '' // keep incomplete line in buffer
-
-      for (const line of lines) {
-        if (line.startsWith('event: ')) {
-          pendingEvent = line.slice(7).trim()
-        } else if (line.startsWith('data: ')) {
-          pendingData = line.slice(6)
-        } else if (line === '' && pendingEvent) {
-          // Empty line = event boundary, dispatch
-          _dispatchSSEEvent(pendingEvent, pendingData, callbacks)
-          pendingEvent = ''
-          pendingData = ''
-        }
-      }
-    }
-
-    // Handle any remaining event after stream ends
-    if (pendingEvent && pendingData) {
-      _dispatchSSEEvent(pendingEvent, pendingData, callbacks)
-    }
+    await _readSSEStream(response, callbacks)
   }).catch((err) => {
     if (err.name !== 'AbortError') {
       callbacks.onError?.(err instanceof Error ? err.message : 'Search failed')
@@ -141,6 +103,9 @@ function _dispatchSSEEvent(event: string, rawData: string, callbacks: SSECallbac
       case 'results':
         callbacks.onResults?.(data as SearchResponse)
         break
+      case 'waiting_for_input':
+        callbacks.onWaitingForInput?.(data as { session_id: string; questions: string[]; context: string })
+        break
       case 'error':
         callbacks.onError?.(data)
         break
@@ -148,6 +113,113 @@ function _dispatchSSEEvent(event: string, rawData: string, callbacks: SSECallbac
   } catch {
     // If data isn't valid JSON, treat it as a plain string
     if (event === 'error') callbacks.onError?.(rawData)
+  }
+}
+
+// SSE-based reply to agent question — resumes the paused pipeline
+export function replyToAgentSSE(
+  sessionId: string,
+  message: string,
+  token: string,
+  callbacks: SSECallbacks,
+): AbortController {
+  const controller = new AbortController()
+
+  fetch(`${BASE_URL}/search/${sessionId}/reply`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ message }),
+    signal: controller.signal,
+  }).then(async (response) => {
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ detail: 'Reply failed' }))
+      callbacks.onError?.(err.detail || `HTTP ${response.status}`)
+      return
+    }
+    await _readSSEStream(response, callbacks)
+  }).catch((err) => {
+    if (err.name !== 'AbortError') {
+      callbacks.onError?.(err instanceof Error ? err.message : 'Reply failed')
+    }
+  })
+
+  return controller
+}
+
+// SSE-based refinement — streams progress like the main search
+export function refineWithSSE(
+  sessionId: string,
+  message: string,
+  token: string,
+  callbacks: SSECallbacks,
+): AbortController {
+  const controller = new AbortController()
+
+  fetch(`${BASE_URL}/search/${sessionId}/refine`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: JSON.stringify({ message }),
+    signal: controller.signal,
+  }).then(async (response) => {
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ detail: 'Refine failed' }))
+      callbacks.onError?.(err.detail || `HTTP ${response.status}`)
+      return
+    }
+    await _readSSEStream(response, callbacks)
+  }).catch((err) => {
+    if (err.name !== 'AbortError') {
+      callbacks.onError?.(err instanceof Error ? err.message : 'Refine failed')
+    }
+  })
+
+  return controller
+}
+
+// Shared SSE stream reader used by search, reply, and refine
+async function _readSSEStream(response: Response, callbacks: SSECallbacks) {
+  const reader = response.body?.getReader()
+  if (!reader) {
+    callbacks.onError?.('No response stream')
+    return
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let pendingEvent = ''
+  let pendingData = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        pendingEvent = line.slice(7).trim()
+      } else if (line.startsWith('data: ')) {
+        pendingData = line.slice(6)
+      } else if (line === '' && pendingEvent) {
+        _dispatchSSEEvent(pendingEvent, pendingData, callbacks)
+        pendingEvent = ''
+        pendingData = ''
+      }
+    }
+  }
+
+  if (pendingEvent && pendingData) {
+    _dispatchSSEEvent(pendingEvent, pendingData, callbacks)
   }
 }
 
@@ -234,6 +306,12 @@ export interface FlightOption {
   baggage_info?: Record<string, unknown>
   co2_emissions_kg?: number
   booking_links?: string[]
+  // Round-trip fields
+  trip_type?: 'one_way' | 'round_trip'
+  return_segments?: FlightSegment[]
+  return_layovers?: { airport: string; duration_minutes: number; overnight: boolean }[]
+  return_duration_minutes?: number
+  return_airline_names?: string[]
 }
 
 export interface RankedResult {

@@ -4,16 +4,21 @@
 import asyncio
 import json
 import logging
+import random
 
 import anthropic
 
 from config import get_settings
 from claude.prompts import (
     PARSE_SYSTEM_PROMPT, RANK_SYSTEM_PROMPT, REFINE_SYSTEM_PROMPT,
-    ROUTE_ANALYSIS_PROMPT,
+    ROUTE_ANALYSIS_PROMPT, CLARIFICATION_RESPONSE_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
+
+# Retry config for transient API errors (529 overloaded, 500, etc.)
+MAX_RETRIES = 3
+BASE_DELAY = 2.0  # seconds
 
 
 class ClaudeClient:
@@ -28,6 +33,25 @@ class ClaudeClient:
             settings = get_settings()
             self._client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         return self._client
+
+    async def _call_with_retry(self, create_fn, **kwargs):
+        """Call Claude API with exponential backoff retry on transient errors (529, 500)."""
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                return await asyncio.to_thread(create_fn, **kwargs)
+            except anthropic.APIStatusError as e:
+                last_error = e
+                if e.status_code in (529, 500, 502, 503) and attempt < MAX_RETRIES - 1:
+                    delay = BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        f"Claude API {e.status_code} (attempt {attempt + 1}/{MAX_RETRIES}), "
+                        f"retrying in {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+        raise last_error  # Should not reach here, but just in case
 
     def _inject_preferences(self, base_prompt: str, preferences_context: str = "") -> str:
         """Append user preferences to a system prompt if they exist."""
@@ -50,7 +74,7 @@ class ClaudeClient:
         system_prompt = self._inject_preferences(PARSE_SYSTEM_PROMPT, preferences_context)
 
         try:
-            response = await asyncio.to_thread(
+            response = await self._call_with_retry(
                 client.messages.create,
                 model=settings.claude_model,
                 max_tokens=1024,
@@ -106,7 +130,7 @@ class ClaudeClient:
 
         try:
             system_prompt = self._inject_preferences(ROUTE_ANALYSIS_PROMPT, preferences_context)
-            response = await asyncio.to_thread(
+            response = await self._call_with_retry(
                 client.messages.create,
                 model=settings.claude_model,
                 max_tokens=1024,
@@ -212,7 +236,7 @@ class ClaudeClient:
 
         try:
             system_prompt = self._inject_preferences(RANK_SYSTEM_PROMPT, preferences_context)
-            response = await asyncio.to_thread(
+            response = await self._call_with_retry(
                 client.messages.create,
                 model=settings.claude_model,
                 max_tokens=2048,
@@ -271,13 +295,13 @@ class ClaudeClient:
 
         user_message = json.dumps({
             "current_query": current_query,
-            "conversation_history": conversation_history[-5:],  # Last 5 messages
+            "conversation_history": conversation_history[-10:],  # Last 10 messages for full context
             "user_message": refinement_message,
         }, indent=2)
 
         try:
             system_prompt = self._inject_preferences(REFINE_SYSTEM_PROMPT, preferences_context)
-            response = await asyncio.to_thread(
+            response = await self._call_with_retry(
                 client.messages.create,
                 model=settings.claude_model,
                 max_tokens=1024,
@@ -304,4 +328,59 @@ class ClaudeClient:
                 "message": "I couldn't understand that refinement. Could you rephrase?",
                 "updated_query": None,
                 "needs_new_search": False,
+            }
+
+    async def incorporate_clarification(self, questions: list[str],
+                                         user_answer: str,
+                                         preferences_context: str = "") -> dict:
+        """
+        Process user's answer to clarifying questions and return search adjustments.
+
+        Returns: {
+            "adjusted_preferences": ["avoid_long_layovers", ...],
+            "adjusted_max_stops": int | null,
+            "notes_for_ranking": "User prefers shorter layovers...",
+            "preference_to_save": {"content": "...", "category": "..."} | null,
+            "summary": "Got it, I'll look for shorter connections..."
+        }
+        """
+        settings = get_settings()
+        client = self._get_client()
+
+        prompt = CLARIFICATION_RESPONSE_PROMPT.format(
+            questions="\n".join(f"- {q}" for q in questions),
+            answer=user_answer,
+        )
+
+        system_prompt = self._inject_preferences(prompt, preferences_context)
+
+        try:
+            response = await self._call_with_retry(
+                client.messages.create,
+                model=settings.claude_model,
+                max_tokens=512,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_answer}
+                ],
+            )
+
+            text = response.content[0].text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
+
+            result = json.loads(text)
+            logger.info(f"Clarification result: {result.get('summary', '')}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Claude incorporate_clarification failed: {e}")
+            return {
+                "adjusted_preferences": [],
+                "adjusted_max_stops": None,
+                "notes_for_ranking": "",
+                "summary": "I'll proceed with your search.",
             }

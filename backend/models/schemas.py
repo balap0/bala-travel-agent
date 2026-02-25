@@ -22,6 +22,11 @@ class RefineRequest(BaseModel):
     message: str = Field(..., min_length=2, max_length=1000, description="Conversational refinement")
 
 
+class ReplyRequest(BaseModel):
+    """User's reply to an agent question during the search conversation."""
+    message: str = Field(..., min_length=1, max_length=2000, description="Reply to agent's question")
+
+
 # --- Internal Models (Claude parse output) ---
 
 class ParsedQuery(BaseModel):
@@ -64,7 +69,7 @@ class LayoverDetail(BaseModel):
 
 
 class FlightOption(BaseModel):
-    """A complete flight itinerary (possibly multi-segment)."""
+    """A complete flight itinerary (possibly multi-segment, one-way or round-trip)."""
     id: str
     source: str = Field(..., description="Data source: amadeus or serpapi")
     segments: list[FlightSegment]
@@ -78,6 +83,12 @@ class FlightOption(BaseModel):
     co2_emissions_kg: Optional[float] = None
     booking_links: Optional[list[str]] = None
     fare_brand: Optional[str] = None
+    # Round-trip fields
+    trip_type: str = Field(default="one_way", description="one_way or round_trip")
+    return_segments: list[FlightSegment] = Field(default_factory=list)
+    return_layovers: list[LayoverDetail] = Field(default_factory=list)
+    return_duration_minutes: int = Field(default=0)
+    return_airline_names: list[str] = Field(default_factory=list)
 
 
 class RankedResult(BaseModel):

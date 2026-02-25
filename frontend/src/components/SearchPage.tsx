@@ -1,11 +1,10 @@
-// Main search page — SSE streaming with progressive agent thinking timeline
+// Main search page — conversational interface with SSE streaming
+// The agent and user communicate through a chat thread with embedded flight results
 
 import { useState, useRef, useCallback } from 'react'
-import { searchWithSSE, api, SearchResponse, RouteAnalysis } from '../api/client'
-import SearchInput from './SearchInput'
-import AgentThinking, { ThinkingStep } from './AgentThinking'
-import ResultsList from './ResultsList'
-import RefineInput from './RefineInput'
+import { searchWithSSE, replyToAgentSSE, refineWithSSE, api, SearchResponse, SSECallbacks } from '../api/client'
+import ChatThread, { ConversationMessage } from './ChatThread'
+import ConversationInput from './ConversationInput'
 import PreferencesPanel from './PreferencesPanel'
 
 interface SearchPageProps {
@@ -13,94 +12,142 @@ interface SearchPageProps {
   onLogout: () => void
 }
 
-type ViewState = 'idle' | 'searching' | 'results' | 'error'
+type AgentState = 'idle' | 'thinking' | 'waiting_for_input' | 'ready'
+
+let msgCounter = 0
+function nextMsgId() { return `msg_${++msgCounter}_${Date.now()}` }
 
 export default function SearchPage({ token, onLogout }: SearchPageProps) {
-  const [viewState, setViewState] = useState<ViewState>('idle')
-  const [isRefining, setIsRefining] = useState(false)
-  const [searchResponse, setSearchResponse] = useState<SearchResponse | null>(null)
-  const [routeAnalysis, setRouteAnalysis] = useState<RouteAnalysis | undefined>()
-  const [thinkingSteps, setThinkingSteps] = useState<ThinkingStep[]>([])
+  const [messages, setMessages] = useState<ConversationMessage[]>([])
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [agentState, setAgentState] = useState<AgentState>('idle')
+  const [latestResults, setLatestResults] = useState<SearchResponse | null>(null)
   const [error, setError] = useState('')
   const [prefsOpen, setPrefsOpen] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
 
-  const addStep = useCallback((type: ThinkingStep['type'], message: string) => {
-    setThinkingSteps(prev => [...prev, { type, message, timestamp: Date.now() }])
+  // Helper to append a message to the conversation
+  const addMessage = useCallback((msg: Omit<ConversationMessage, 'id' | 'timestamp'>) => {
+    setMessages(prev => [...prev, { ...msg, id: nextMsgId(), timestamp: Date.now() }])
   }, [])
 
-  const handleSearch = useCallback((query: string) => {
-    // Abort any in-flight search
-    abortRef.current?.abort()
+  // Mark the last question as answered
+  const markQuestionAnswered = useCallback((answer: string) => {
+    setMessages(prev => prev.map(m =>
+      m.type === 'question' && !m.answered
+        ? { ...m, answered: true, answer }
+        : m
+    ))
+  }, [])
 
-    setError('')
-    setViewState('searching')
-    setThinkingSteps([])
-    setSearchResponse(null)
-    setRouteAnalysis(undefined)
-
-    const controller = searchWithSSE(query, token, {
-      onThinking: (msg) => addStep('thinking', msg),
-      onStrategy: (msg) => addStep('strategy', msg),
-      onClarify: (msg) => addStep('clarify', msg),
-      onSearching: (msg) => addStep('searching', msg),
-      onRanking: (msg) => addStep('ranking', msg),
-      onResults: (response) => {
-        setSearchResponse(response)
-        if (response.route_analysis) {
-          setRouteAnalysis(response.route_analysis)
-        }
-        setViewState('results')
-      },
-      onError: (err) => {
-        if (err.includes('401')) {
-          onLogout()
-          return
-        }
-        setError(err)
-        setViewState('error')
-      },
-    }, searchResponse?.session_id)
-
-    abortRef.current = controller
-  }, [token, searchResponse?.session_id, onLogout, addStep])
-
-  const handleRefine = async (message: string) => {
-    if (!searchResponse) return
-    setIsRefining(true)
-
-    try {
-      const response = await api.refine(searchResponse.session_id, message, token)
-      if (response.results) {
-        setSearchResponse({
-          ...searchResponse,
-          results: response.results,
-          parsed_query: response.updated_query || searchResponse.parsed_query,
-        })
+  // Build SSE callbacks that feed into the conversation
+  const makeCallbacks = useCallback((): SSECallbacks => ({
+    onThinking: (msg) => addMessage({ role: 'agent', type: 'thinking', content: msg }),
+    onStrategy: (msg) => addMessage({ role: 'agent', type: 'strategy', content: msg }),
+    onClarify: (question) => addMessage({
+      role: 'agent', type: 'question', content: question,
+      questionId: `q_${Date.now()}`,
+    }),
+    onSearching: (msg) => addMessage({ role: 'agent', type: 'searching', content: msg }),
+    onRanking: (msg) => addMessage({ role: 'agent', type: 'ranking', content: msg }),
+    onResults: (response) => {
+      addMessage({
+        role: 'agent', type: 'results',
+        content: `Found ${response.total_options_found} options`,
+        searchResponse: response,
+      })
+      setLatestResults(response)
+      setSessionId(response.session_id)
+      setAgentState('ready')
+    },
+    onWaitingForInput: (data) => {
+      setSessionId(data.session_id)
+      setAgentState('waiting_for_input')
+    },
+    onError: (err) => {
+      if (err.includes('401')) {
+        onLogout()
+        return
       }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Refinement failed')
-      setViewState('error')
-    } finally {
-      setIsRefining(false)
-    }
-  }
+      // Friendly error messages for common issues
+      if (err.includes('529') || err.includes('overloaded')) {
+        setError('The AI service is temporarily overloaded. Please try again in a moment.')
+      } else if (err.includes('timeout') || err.includes('Timeout')) {
+        setError('The search timed out. Please try again.')
+      } else {
+        setError(err)
+      }
+      setAgentState('ready')
+    },
+  }), [addMessage, onLogout])
 
+  // Initial search — clears previous conversation if starting fresh
+  const handleSearch = useCallback((query: string) => {
+    abortRef.current?.abort()
+    setError('')
+    setAgentState('thinking')
+    setLatestResults(null)
+
+    // If no session or previous error, start fresh conversation
+    if (!sessionId || error) {
+      setMessages([])
+      setSessionId(null)
+    }
+
+    // Add user message to conversation
+    addMessage({ role: 'user', type: 'text', content: query })
+
+    const controller = searchWithSSE(query, token, makeCallbacks(), sessionId || undefined)
+    abortRef.current = controller
+  }, [token, sessionId, error, addMessage, makeCallbacks])
+
+  // Reply to agent question (resumes paused pipeline)
+  const handleReplyToQuestion = useCallback((answer: string) => {
+    if (!sessionId) return
+
+    markQuestionAnswered(answer)
+    setAgentState('thinking')
+
+    const controller = replyToAgentSSE(sessionId, answer, token, makeCallbacks())
+    abortRef.current = controller
+  }, [sessionId, token, markQuestionAnswered, makeCallbacks])
+
+  // Refine search (post-results follow-up)
+  const handleRefine = useCallback((message: string) => {
+    if (!sessionId) return
+
+    addMessage({ role: 'user', type: 'text', content: message })
+    setAgentState('thinking')
+
+    const controller = refineWithSSE(sessionId, message, token, makeCallbacks())
+    abortRef.current = controller
+  }, [sessionId, token, addMessage, makeCallbacks])
+
+  // Unified submit handler — routes based on state
+  const handleSubmit = useCallback((message: string) => {
+    if (latestResults && sessionId && !error) {
+      handleRefine(message)
+    } else {
+      handleSearch(message)
+    }
+  }, [latestResults, sessionId, error, handleRefine, handleSearch])
+
+  // Interaction logging for flight card clicks
   const handleInteraction = useCallback((action: string, flightRank: number, flightId: string) => {
     api.logInteraction({
-      session_id: searchResponse?.session_id,
+      session_id: sessionId || undefined,
       action,
       flight_rank: flightRank,
       flight_id: flightId,
     }, token)
-  }, [searchResponse?.session_id, token])
+  }, [sessionId, token])
 
-  const isSearching = viewState === 'searching'
+  const isLoading = agentState === 'thinking'
 
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
-      <header className="bg-white border-b px-4 py-3 flex items-center justify-between">
+      <header className="bg-white border-b px-4 py-3 flex items-center justify-between sticky top-0 z-10">
         <h1 className="text-xl font-bold text-gray-900">Bala Travel Agent</h1>
         <div className="flex items-center gap-4">
           <button
@@ -120,19 +167,27 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
       </header>
 
       {/* Main content */}
-      <main className="max-w-3xl mx-auto px-4 py-8">
-        {/* Search input — always visible */}
-        <SearchInput
-          onSearch={handleSearch}
-          loading={isSearching || isRefining}
-        />
+      <main className="max-w-3xl mx-auto px-4 py-6 pb-48">
+        {/* Show search input at top when no messages yet */}
+        {messages.length === 0 && (
+          <ConversationInput
+            agentState={agentState}
+            hasResults={false}
+            onSubmit={handleSearch}
+            loading={isLoading}
+          />
+        )}
 
-        {/* Agent thinking timeline — visible during and after search */}
-        <AgentThinking
-          steps={thinkingSteps}
-          isActive={isSearching}
-          routeAnalysis={routeAnalysis}
-        />
+        {/* Idle state */}
+        {messages.length === 0 && agentState === 'idle' && (
+          <div className="mt-12 text-center text-gray-400">
+            <p className="text-lg">Type your travel request above</p>
+            <p className="mt-2 text-sm">
+              Example: &quot;I want a flight from Bangalore to Libreville around Sep 4th,
+              business class, returning Sep 15th. No Air India.&quot;
+            </p>
+          </div>
+        )}
 
         {/* Error */}
         {error && (
@@ -141,49 +196,23 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
           </div>
         )}
 
-        {/* Results */}
-        {viewState === 'results' && searchResponse && (
-          <>
-            <div className="mt-6 text-sm text-gray-500">
-              Found {searchResponse.total_options_found} options from{' '}
-              {searchResponse.sources_used.join(' + ')} in{' '}
-              {searchResponse.search_duration_seconds}s
-            </div>
+        {/* Conversation thread */}
+        <ChatThread
+          messages={messages}
+          agentState={agentState}
+          onReplyToQuestion={handleReplyToQuestion}
+          onInteraction={handleInteraction}
+        />
 
-            {/* Parsed query summary */}
-            {searchResponse.parsed_query && (
-              <div className="mt-4 p-4 bg-gray-50 border border-gray-200 rounded-lg">
-                <p className="text-sm font-medium text-gray-600 mb-2">Search parameters:</p>
-                <div className="grid grid-cols-2 gap-2 text-sm">
-                  <div><span className="text-gray-500">From:</span> {searchResponse.parsed_query.origin}</div>
-                  <div><span className="text-gray-500">To:</span> {searchResponse.parsed_query.destination}</div>
-                  <div><span className="text-gray-500">Date:</span> {searchResponse.parsed_query.departure_date}</div>
-                  <div><span className="text-gray-500">Class:</span> {searchResponse.parsed_query.cabin_class}</div>
-                  <div><span className="text-gray-500">Max stops:</span> {searchResponse.parsed_query.max_stops}</div>
-                  {searchResponse.parsed_query.preferences.length > 0 && (
-                    <div className="col-span-2">
-                      <span className="text-gray-500">Priorities:</span>{' '}
-                      {searchResponse.parsed_query.preferences.map(p => p.replace('_', ' ')).join(', ')}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            <ResultsList results={searchResponse.results} onInteraction={handleInteraction} />
-
-            <RefineInput onRefine={handleRefine} loading={isRefining} />
-          </>
-        )}
-
-        {/* Idle state */}
-        {viewState === 'idle' && (
-          <div className="mt-12 text-center text-gray-400">
-            <p className="text-lg">Type your travel request above</p>
-            <p className="mt-2 text-sm">
-              Example: "I want a flight from Bangalore to Libreville around Sep 4th,
-              business class, minimize travel time"
-            </p>
+        {/* Bottom input — shows after first search, acts as refinement input */}
+        {messages.length > 0 && agentState !== 'waiting_for_input' && (
+          <div className="mt-6">
+            <ConversationInput
+              agentState={agentState}
+              hasResults={!!latestResults}
+              onSubmit={handleSubmit}
+              loading={isLoading}
+            />
           </div>
         )}
       </main>

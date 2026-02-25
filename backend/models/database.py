@@ -35,14 +35,21 @@ async def init_db():
                 updated_at TEXT NOT NULL,
                 parsed_query TEXT,
                 conversation_history TEXT DEFAULT '[]',
-                last_results TEXT
+                last_results TEXT,
+                pipeline_state TEXT DEFAULT NULL
             )
         """)
+        # Add pipeline_state column if it doesn't exist (for existing DBs)
+        try:
+            await db.execute("ALTER TABLE sessions ADD COLUMN pipeline_state TEXT DEFAULT NULL")
+        except Exception:
+            pass  # Column already exists
         await db.commit()
 
 
 async def save_session(session_id: str, parsed_query: dict = None,
-                       conversation: list = None, results: list = None):
+                       conversation: list = None, results: list = None,
+                       pipeline_state: dict = None):
     """Save or update a search session."""
     now = datetime.utcnow().isoformat()
 
@@ -65,6 +72,9 @@ async def save_session(session_id: str, parsed_query: dict = None,
             if results is not None:
                 updates.append("last_results = ?")
                 params.append(_dumps(results))
+            if pipeline_state is not None:
+                updates.append("pipeline_state = ?")
+                params.append(_dumps(pipeline_state))
             params.append(session_id)
 
             await db.execute(
@@ -74,13 +84,14 @@ async def save_session(session_id: str, parsed_query: dict = None,
         else:
             await db.execute(
                 """INSERT INTO sessions (session_id, created_at, updated_at,
-                   parsed_query, conversation_history, last_results)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   parsed_query, conversation_history, last_results, pipeline_state)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, now, now,
                     _dumps(parsed_query) if parsed_query else None,
                     _dumps(conversation or []),
                     _dumps(results) if results else None,
+                    _dumps(pipeline_state) if pipeline_state else None,
                 )
             )
         await db.commit()
@@ -104,4 +115,5 @@ async def get_session(session_id: str) -> dict | None:
             "parsed_query": json.loads(row[3]) if row[3] else None,
             "conversation_history": json.loads(row[4]) if row[4] else [],
             "last_results": json.loads(row[5]) if row[5] else None,
+            "pipeline_state": json.loads(row[6]) if len(row) > 6 and row[6] else None,
         }

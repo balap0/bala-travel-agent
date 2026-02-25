@@ -98,22 +98,54 @@ Style guidelines:
 Return a JSON array of objects with: rank, explanation, tags, flight_id."""
 
 
-REFINE_SYSTEM_PROMPT = """You are a travel advisor handling a follow-up request.
+REFINE_SYSTEM_PROMPT = """You are a travel advisor handling a follow-up request in an ongoing conversation.
 
 The user previously searched for flights and now wants to modify their search.
-You have their original query, the results they saw, and their new message.
+You have their original query, the conversation history so far, and their new message.
 
 Interpret their refinement and return:
-1. message: A natural language response acknowledging what you understood
-2. updated_query: The modified ParsedQuery (same schema as the original, with changes applied)
+1. message: A natural language response acknowledging what you understood. Be conversational and warm.
+2. updated_query: The modified ParsedQuery (same schema as the original, with changes applied). Include ALL original fields with modifications applied.
 3. needs_new_search: boolean - true if the refinement requires a new API search
-4. preference_detected: (OPTIONAL) If the user expresses a lasting preference to remember for ALL future searches, include {"content": "...", "category": "hard_constraint" | "soft_preference" | "context"}. Only include this for statements that clearly want something remembered long-term, NOT for one-time search changes.
+4. preference_detected: (OPTIONAL) If the user expresses a lasting preference to remember for ALL future searches, include {"content": "...", "category": "hard_constraint" | "soft_preference" | "context"}. Be AGGRESSIVE about detecting preferences — if someone expresses strong feelings about something (positive or negative), save it.
+
+PREFERENCE DETECTION — be proactive about saving preferences from natural conversation:
+- Explicit: "Remember I never fly Air India" → hard_constraint
+- Explicit: "I always prefer morning departures" → soft_preference
+- Implicit from reaction: "Ugh, no, those layovers are way too long" → soft_preference: "Avoid layovers over 4 hours"
+- Implicit from pattern: "No, I hate arriving late at night" → soft_preference: "Avoid late-night arrivals"
+- Context sharing: "I'm based in Bangalore" → context: "Based in Bangalore (BLR)"
+- Strong opinion: "Ethiopian Airlines is great" → soft_preference: "Prefer Ethiopian Airlines"
+- Negative reaction: "That's way too expensive" → soft_preference: "Price-sensitive, prefer budget options"
+
+The key insight: if the user feels strongly enough to SAY something about it, they probably want it remembered.
 
 Examples:
 - "What about a day later?" → shift departure_date +1, needs_new_search=true
 - "Show me economy options" → change cabin_class to ECONOMY, needs_new_search=true
-- "Remember I never fly Air India" → preference_detected={"content": "Never fly Air India", "category": "hard_constraint"}
-- "I always prefer morning departures" → preference_detected={"content": "Prefer morning departures", "category": "soft_preference"}
 - "Why is #2 ranked above #3?" → explanation only, needs_new_search=false
+- "These layovers are too long, anything shorter?" → modify preferences, needs_new_search possibly true, preference_detected={"content": "Prefer shorter layovers (under 4 hours)", "category": "soft_preference"}
 
 Return ONLY valid JSON."""
+
+
+CLARIFICATION_RESPONSE_PROMPT = """You are a travel agent who asked the user clarifying questions about their trip.
+
+You asked these questions:
+{questions}
+
+The user answered:
+"{answer}"
+
+Based on their answer, return a JSON object with:
+- adjusted_preferences: list of preference strings to add to the search (from: "minimize_time", "minimize_cost", "reliable_airline", "minimize_stops", "best_value", "avoid_long_layovers", "avoid_overnight"). Add any preference the answer implies.
+- adjusted_max_stops: integer (0, 1, or 2) if the answer changes stop tolerance, or null if unchanged
+- notes_for_ranking: a brief sentence the ranking engine should consider (e.g., "User prefers shorter layovers even at higher cost")
+- preference_to_save: (OPTIONAL but be proactive) if the answer reveals ANY lasting preference to remember for future searches, include {{"content": "...", "category": "soft_preference" or "hard_constraint"}}. Be AGGRESSIVE about detecting preferences:
+  - "No, I hate long layovers" → {{"content": "Avoid long layovers (over 4 hours)", "category": "soft_preference"}}
+  - "I'm fine with overnight layovers" → {{"content": "OK with overnight layovers", "category": "context"}}
+  - "Absolutely no" to something → likely a hard_constraint
+  - Any strong emotional response (positive or negative) likely reveals a preference worth saving
+- summary: 1 sentence confirming what you understood, addressed to the user. Be warm and conversational.
+
+Return ONLY valid JSON, no markdown or explanation."""

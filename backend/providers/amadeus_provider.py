@@ -67,6 +67,10 @@ class AmadeusProvider(FlightProvider):
                 "max": 20,  # Cap results to stay within free tier
             }
 
+            # Round-trip: add return date if user requested it
+            if query.return_date:
+                params["returnDate"] = query.return_date.isoformat()
+
             # Add cabin class if not economy (Amadeus default is all classes)
             if query.cabin_class and query.cabin_class != "ECONOMY":
                 params["travelClass"] = query.cabin_class
@@ -101,89 +105,105 @@ class AmadeusProvider(FlightProvider):
             logger.error(f"Amadeus API error: {e.response.status_code} - {e.response.body}")
             return []
 
-    def _parse_offer(self, offer: dict, dictionaries: dict) -> FlightOption | None:
-        """Parse a single Amadeus flight offer into our FlightOption model."""
-        try:
-            # Generate a unique ID for this offer
-            offer_id = f"ama_{offer.get('id', hashlib.md5(str(offer).encode()).hexdigest()[:8])}"
+    def _parse_itinerary(self, itinerary: dict, offer: dict, dictionaries: dict,
+                         segment_offset: int = 0) -> tuple[list[FlightSegment], list[LayoverDetail], set[str], str, int]:
+        """Parse a single itinerary (outbound or return) from an Amadeus offer.
+        Returns (segments, layovers, airline_names_set, cabin_class, total_duration_minutes).
+        segment_offset: index offset for fare_details lookup (0 for outbound, N for return).
+        """
+        segments_data = itinerary.get("segments", [])
+        if not segments_data:
+            return [], [], set(), "ECONOMY", 0
 
-            # Get price
+        segments = []
+        airline_names = set()
+        cabin_class = "ECONOMY"
+
+        for i, seg in enumerate(segments_data):
+            carrier_code = seg.get("carrierCode", "")
+            carriers = dictionaries.get("carriers", {})
+            airline_name = carriers.get(carrier_code, carrier_code)
+            airline_names.add(airline_name)
+
+            dep_time = datetime.fromisoformat(seg["departure"]["at"])
+            arr_time = datetime.fromisoformat(seg["arrival"]["at"])
+            duration_minutes = self._parse_duration(seg.get("duration", "PT0H0M"))
+
+            traveler_pricings = offer.get("travelerPricings", [])
+            if traveler_pricings:
+                fare_details = traveler_pricings[0].get("fareDetailsBySegment", [])
+                fare_idx = segment_offset + i
+                if fare_idx < len(fare_details):
+                    cabin_class = fare_details[fare_idx].get("cabin", "ECONOMY")
+
+            aircraft_code = seg.get("aircraft", {}).get("code", "")
+            aircraft_dict = dictionaries.get("aircraft", {})
+            aircraft = aircraft_dict.get(aircraft_code, aircraft_code) if aircraft_code else None
+
+            segments.append(FlightSegment(
+                airline=airline_name,
+                airline_code=carrier_code,
+                flight_number=f"{carrier_code}{seg.get('number', '')}",
+                departure_airport=seg["departure"]["iataCode"],
+                departure_time=dep_time,
+                arrival_airport=seg["arrival"]["iataCode"],
+                arrival_time=arr_time,
+                duration_minutes=duration_minutes,
+                aircraft=aircraft,
+                cabin_class=cabin_class,
+            ))
+
+        layovers = []
+        for i in range(len(segments) - 1):
+            arr = segments[i].arrival_time
+            dep = segments[i + 1].departure_time
+            layover_minutes = int((dep - arr).total_seconds() / 60)
+            overnight = arr.date() != dep.date()
+            layovers.append(LayoverDetail(
+                airport=segments[i].arrival_airport,
+                duration_minutes=layover_minutes,
+                overnight=overnight,
+            ))
+
+        total_duration = self._parse_duration(itinerary.get("duration", "PT0H0M"))
+        return segments, layovers, airline_names, cabin_class, total_duration
+
+    def _parse_offer(self, offer: dict, dictionaries: dict) -> FlightOption | None:
+        """Parse a single Amadeus flight offer into our FlightOption model.
+        Handles both one-way (1 itinerary) and round-trip (2 itineraries).
+        """
+        try:
+            offer_id = f"ama_{offer.get('id', hashlib.md5(str(offer).encode()).hexdigest()[:8])}"
             price_data = offer.get("price", {})
             price_usd = float(price_data.get("grandTotal", price_data.get("total", 0)))
 
-            # Parse itineraries (usually 1 for one-way, 2 for round-trip)
-            # We take the first itinerary (outbound)
             itineraries = offer.get("itineraries", [])
             if not itineraries:
                 return None
 
-            outbound = itineraries[0]
-            segments_data = outbound.get("segments", [])
+            # Parse outbound itinerary
+            segments, layovers, airline_names, cabin_class, total_duration = \
+                self._parse_itinerary(itineraries[0], offer, dictionaries, segment_offset=0)
 
-            if not segments_data:
+            if not segments:
                 return None
 
-            # Parse each segment
-            segments = []
-            airline_names = set()
-            cabin_class = "ECONOMY"
+            # Parse return itinerary if present (round-trip)
+            return_segments = []
+            return_layovers = []
+            return_airline_names = set()
+            return_duration = 0
+            trip_type = "one_way"
 
-            for i, seg in enumerate(segments_data):
-                carrier_code = seg.get("carrierCode", "")
-                # Look up carrier name from dictionaries
-                carriers = dictionaries.get("carriers", {})
-                airline_name = carriers.get(carrier_code, carrier_code)
-                airline_names.add(airline_name)
+            if len(itineraries) > 1:
+                trip_type = "round_trip"
+                outbound_seg_count = len(itineraries[0].get("segments", []))
+                return_segments, return_layovers, return_airline_names, _, return_duration = \
+                    self._parse_itinerary(itineraries[1], offer, dictionaries,
+                                          segment_offset=outbound_seg_count)
 
-                # Parse departure/arrival times
-                dep_time = datetime.fromisoformat(seg["departure"]["at"])
-                arr_time = datetime.fromisoformat(seg["arrival"]["at"])
-
-                # Calculate segment duration from ISO 8601 duration
-                duration_str = seg.get("duration", "PT0H0M")
-                duration_minutes = self._parse_duration(duration_str)
-
-                # Get cabin class from traveler pricings if available
-                traveler_pricings = offer.get("travelerPricings", [])
-                if traveler_pricings:
-                    fare_details = traveler_pricings[0].get("fareDetailsBySegment", [])
-                    if i < len(fare_details):
-                        cabin_class = fare_details[i].get("cabin", "ECONOMY")
-
-                # Get aircraft info
-                aircraft_code = seg.get("aircraft", {}).get("code", "")
-                aircraft_dict = dictionaries.get("aircraft", {})
-                aircraft = aircraft_dict.get(aircraft_code, aircraft_code) if aircraft_code else None
-
-                segments.append(FlightSegment(
-                    airline=airline_name,
-                    airline_code=carrier_code,
-                    flight_number=f"{carrier_code}{seg.get('number', '')}",
-                    departure_airport=seg["departure"]["iataCode"],
-                    departure_time=dep_time,
-                    arrival_airport=seg["arrival"]["iataCode"],
-                    arrival_time=arr_time,
-                    duration_minutes=duration_minutes,
-                    aircraft=aircraft,
-                    cabin_class=cabin_class,
-                ))
-
-            # Calculate layovers between segments
-            layovers = []
-            for i in range(len(segments) - 1):
-                arr = segments[i].arrival_time
-                dep = segments[i + 1].departure_time
-                layover_minutes = int((dep - arr).total_seconds() / 60)
-                overnight = arr.date() != dep.date()
-
-                layovers.append(LayoverDetail(
-                    airport=segments[i].arrival_airport,
-                    duration_minutes=layover_minutes,
-                    overnight=overnight,
-                ))
-
-            # Total duration from the itinerary
-            total_duration = self._parse_duration(outbound.get("duration", "PT0H0M"))
+            # Combine all airline names (outbound + return) for filtering
+            all_airlines = airline_names | return_airline_names
 
             # Get fare brand if available
             fare_brand = None
@@ -209,9 +229,14 @@ class AmadeusProvider(FlightProvider):
                 layovers=layovers,
                 price_usd=price_usd,
                 cabin_class=cabin_class,
-                airline_names=list(airline_names),
+                airline_names=list(all_airlines),
                 co2_emissions_kg=co2,
                 fare_brand=fare_brand,
+                trip_type=trip_type,
+                return_segments=return_segments,
+                return_layovers=return_layovers,
+                return_duration_minutes=return_duration,
+                return_airline_names=list(return_airline_names),
             )
 
         except (KeyError, ValueError, TypeError) as e:

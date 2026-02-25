@@ -52,8 +52,11 @@ export default function FlightCard({ result, onInteraction }: FlightCardProps) {
         </div>
       </div>
 
-      {/* Route segments */}
-      <div className="mt-3 flex items-center gap-2 text-sm text-gray-600">
+      {/* Outbound route segments */}
+      <div className="mt-3 flex items-center gap-2 text-sm text-gray-600 flex-wrap">
+        {flight.trip_type === 'round_trip' && (
+          <span className="text-xs font-medium text-brand-600 mr-1">✈ Out</span>
+        )}
         {flight.segments.map((seg, i) => (
           <span key={i} className="flex items-center gap-1">
             {i > 0 && <span className="text-gray-400 mx-1">→</span>}
@@ -66,6 +69,29 @@ export default function FlightCard({ result, onInteraction }: FlightCardProps) {
           {flight.segments[flight.segments.length - 1]?.arrival_airport}
         </span>
       </div>
+
+      {/* Return route segments (round-trip only) */}
+      {flight.trip_type === 'round_trip' && flight.return_segments && flight.return_segments.length > 0 && (
+        <div className="mt-2 flex items-center gap-2 text-sm text-gray-600 flex-wrap">
+          <span className="text-xs font-medium text-emerald-600 mr-1">↩ Return</span>
+          {flight.return_segments.map((seg, i) => (
+            <span key={i} className="flex items-center gap-1">
+              {i > 0 && <span className="text-gray-400 mx-1">→</span>}
+              <span className="font-medium">{seg.departure_airport}</span>
+              <span className="text-gray-400">({formatDuration(seg.duration_minutes)})</span>
+            </span>
+          ))}
+          <span className="text-gray-400 mx-1">→</span>
+          <span className="font-medium">
+            {flight.return_segments[flight.return_segments.length - 1]?.arrival_airport}
+          </span>
+          {flight.return_duration_minutes > 0 && (
+            <span className="text-gray-400 ml-2">
+              ({formatDuration(flight.return_duration_minutes)})
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Tags */}
       {tags.length > 0 && (
