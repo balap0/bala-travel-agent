@@ -8,7 +8,10 @@ import logging
 import anthropic
 
 from config import get_settings
-from claude.prompts import PARSE_SYSTEM_PROMPT, RANK_SYSTEM_PROMPT, REFINE_SYSTEM_PROMPT
+from claude.prompts import (
+    PARSE_SYSTEM_PROMPT, RANK_SYSTEM_PROMPT, REFINE_SYSTEM_PROMPT,
+    ROUTE_ANALYSIS_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,75 @@ class ClaudeClient:
         except Exception as e:
             logger.error(f"Claude parse_query failed: {e}")
             raise
+
+    async def analyze_route(self, origin: str, destination: str,
+                            preferences: list[str] = None) -> dict:
+        """
+        Analyze a route to determine search strategy before any flight API calls.
+        Returns a dict matching the RouteAnalysis schema.
+
+        Example:
+          Input:  origin="BLR", destination="LBV"
+          Output: {"difficulty": "challenging", "strategy": "hub_based",
+                   "connecting_hubs": ["ADD", "IST", "CDG"], ...}
+        """
+        settings = get_settings()
+        client = self._get_client()
+
+        user_message = json.dumps({
+            "origin": origin,
+            "destination": destination,
+            "user_preferences": preferences or [],
+        })
+
+        try:
+            response = await asyncio.to_thread(
+                client.messages.create,
+                model=settings.claude_model,
+                max_tokens=1024,
+                system=ROUTE_ANALYSIS_PROMPT,
+                messages=[
+                    {"role": "user", "content": user_message}
+                ],
+            )
+
+            text = response.content[0].text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+                if text.endswith("```"):
+                    text = text[:-3]
+                text = text.strip()
+
+            analysis = json.loads(text)
+            logger.info(
+                f"Route analysis: {origin}→{destination} = {analysis.get('difficulty')} "
+                f"({analysis.get('strategy')}), hubs={analysis.get('connecting_hubs', [])}"
+            )
+            return analysis
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Claude returned invalid JSON for route analysis: {e}")
+            # Fallback: assume standard direct search
+            return {
+                "difficulty": "standard",
+                "strategy": "direct_search",
+                "connecting_hubs": [],
+                "recommended_airlines": [],
+                "destination_brief": "",
+                "clarifying_questions": [],
+                "reasoning": "Defaulting to direct search (route analysis failed).",
+            }
+        except Exception as e:
+            logger.error(f"Claude route analysis failed: {e}")
+            return {
+                "difficulty": "standard",
+                "strategy": "direct_search",
+                "connecting_hubs": [],
+                "recommended_airlines": [],
+                "destination_brief": "",
+                "clarifying_questions": [],
+                "reasoning": "Defaulting to direct search (route analysis failed).",
+            }
 
     async def rank_results(self, parsed_query: dict, flights: list[dict],
                            preferences: list[str]) -> list[dict]:

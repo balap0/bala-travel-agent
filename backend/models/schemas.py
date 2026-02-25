@@ -103,6 +103,7 @@ class SearchResponse(BaseModel):
     sources_used: list[str]
     search_duration_seconds: float
     total_options_found: int
+    route_analysis: Optional["RouteAnalysis"] = None
 
 
 class RefineResponse(BaseModel):
@@ -117,3 +118,22 @@ class ErrorResponse(BaseModel):
     """Standardized error response."""
     error: str
     detail: Optional[str] = None
+
+
+# --- Route Analysis Models (Phase 1: Strategic Search) ---
+
+class RouteAnalysis(BaseModel):
+    """Claude's strategic analysis of a route before any flight API calls."""
+    difficulty: str = Field(..., description="trivial, standard, challenging, or exotic")
+    strategy: str = Field(..., description="direct_search or hub_based")
+    connecting_hubs: list[str] = Field(default_factory=list, description="IATA codes of recommended connecting hubs")
+    recommended_airlines: list[str] = Field(default_factory=list, description="Airlines likely to serve this route")
+    destination_brief: str = Field(default="", description="Key travel context about the destination")
+    clarifying_questions: list[str] = Field(default_factory=list, description="Questions to ask for hard routes")
+    reasoning: str = Field(default="", description="Why this strategy was chosen — shown to user")
+
+
+class SSEEvent(BaseModel):
+    """A single Server-Sent Event during the search pipeline."""
+    event: str = Field(..., description="Event type: thinking, strategy, clarify, searching, ranking, results, error")
+    data: str = Field(..., description="Event payload — natural language message or JSON for results")

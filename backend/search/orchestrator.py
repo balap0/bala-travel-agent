@@ -1,27 +1,32 @@
 # Search orchestrator — the core coordination engine
-# Flow: NL query → Claude parse → Amadeus + SerpAPI (parallel) → merge → Claude rank → response
+# Flow: NL query → Claude parse → Route analysis → Strategy selection → Search → Claude rank → response
+# Supports both SSE streaming (for real-time progress) and regular POST (fallback)
 
 import asyncio
+import json
 import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from auth.middleware import require_auth
 from claude.client import ClaudeClient
 from models.schemas import (
     SearchRequest, SearchResponse, RefineRequest, RefineResponse,
-    ParsedQuery, FlightOption, RankedResult,
+    ParsedQuery, FlightOption, RankedResult, RouteAnalysis,
 )
 from models.database import save_session, get_session
 from providers.amadeus_provider import AmadeusProvider
 from providers.serpapi_provider import SerpAPIProvider
+from search.strategies.direct import DirectSearchStrategy
+from search.strategies.hub_based import HubBasedSearchStrategy
 
 logger = logging.getLogger(__name__)
 search_router = APIRouter()
 
-# Singleton instances (created once, reused across requests)
+# Singleton instances
 claude_client = ClaudeClient()
 amadeus = AmadeusProvider()
 serpapi = SerpAPIProvider()
@@ -30,71 +35,169 @@ serpapi = SerpAPIProvider()
 AMADEUS_MIN_RESULTS = 3
 
 
-@search_router.post("", response_model=SearchResponse)
-async def search_flights(request: SearchRequest, token: str = Depends(require_auth)):
+def _sse_event(event: str, data: str) -> str:
+    """Format a Server-Sent Event string."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _sse_json_event(event: str, data: dict) -> str:
+    """Format an SSE event with a JSON payload."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@search_router.post("")
+async def search_flights(request: SearchRequest, req: Request, token: str = Depends(require_auth)):
     """
-    Main search endpoint. Full pipeline:
+    Main search endpoint. Streams progress via SSE.
+
+    Pipeline:
     1. Claude parses NL query → structured params
-    2. Search Amadeus (always) + SerpAPI (if needed) in parallel
-    3. Merge and deduplicate results
-    4. Claude ranks and explains each result
-    5. Save session and return
+    2. Claude analyzes route → strategy selection
+    3. Execute strategy (direct or hub-based search)
+    4. Merge, deduplicate, rank with Claude
+    5. Save session and return final results
+    """
+    # Check if client wants SSE (Accept header) or regular JSON
+    accept = req.headers.get("accept", "")
+    if "text/event-stream" in accept:
+        return StreamingResponse(
+            _search_stream(request, token),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    else:
+        # Fallback: regular JSON response (collect all SSE events, return final)
+        return await _search_json(request)
+
+
+async def _search_stream(request: SearchRequest, token: str):
+    """Generator that yields SSE events as the search pipeline progresses."""
+    try:
+        async for event, data in _run_pipeline(request):
+            if event == "results":
+                yield _sse_json_event("results", data)
+            else:
+                yield _sse_event(event, data)
+    except Exception as e:
+        logger.error(f"Search stream error: {e}")
+        yield _sse_event("error", f"Search failed: {e}")
+
+
+async def _search_json(request: SearchRequest) -> SearchResponse:
+    """Non-streaming search — collects pipeline output and returns final JSON."""
+    final_result = None
+    async for event, data in _run_pipeline(request):
+        if event == "results":
+            final_result = data
+
+    if final_result is None:
+        raise HTTPException(status_code=500, detail="Search produced no results")
+
+    return SearchResponse(**final_result)
+
+
+async def _run_pipeline(request: SearchRequest):
+    """
+    Core search pipeline. Yields (event_type, data) tuples.
+    Final event is ("results", SearchResponse_dict).
     """
     start_time = time.time()
     session_id = request.session_id or str(uuid.uuid4())
 
-    # --- Step 1: Parse natural language query with Claude ---
+    # --- Step 1: Parse natural language query ---
+    yield ("thinking", "Understanding your request...")
+
     try:
         parsed_dict = await claude_client.parse_query(request.query)
         parsed_query = ParsedQuery(**parsed_dict)
     except Exception as e:
         logger.error(f"Query parsing failed: {e}")
-        raise HTTPException(status_code=400, detail=f"Could not understand query: {e}")
+        yield ("error", f"Could not understand query: {e}")
+        return
 
-    # Check if Claude needs clarification
+    yield ("thinking", f"Got it — {parsed_query.origin} → {parsed_query.destination}, "
+           f"{parsed_query.departure_date}, {parsed_query.cabin_class}")
+
+    # Check if Claude needs clarification from the parse step
     if parsed_query.clarification_needed:
-        return SearchResponse(
+        yield ("clarify", parsed_query.clarification_needed)
+        yield ("results", SearchResponse(
             session_id=session_id,
             parsed_query=parsed_query,
             results=[],
             sources_used=[],
             search_duration_seconds=round(time.time() - start_time, 2),
             total_options_found=0,
+        ).model_dump(mode="json"))
+        return
+
+    # --- Step 2: Analyze route and select strategy ---
+    yield ("thinking", f"Analyzing the {parsed_query.origin} → {parsed_query.destination} route...")
+
+    try:
+        analysis_dict = await claude_client.analyze_route(
+            parsed_query.origin, parsed_query.destination, parsed_query.preferences
+        )
+        route_analysis = RouteAnalysis(**analysis_dict)
+    except Exception as e:
+        logger.error(f"Route analysis failed, defaulting to direct search: {e}")
+        route_analysis = RouteAnalysis(
+            difficulty="standard",
+            strategy="direct_search",
+            reasoning="Defaulting to direct search.",
         )
 
-    # --- Step 2: Search flight providers ---
+    # Send route analysis to client
+    yield ("strategy", route_analysis.reasoning)
+
+    if route_analysis.destination_brief:
+        yield ("strategy", route_analysis.destination_brief)
+
+    # Handle clarifying questions for hard routes
+    if route_analysis.clarifying_questions:
+        for q in route_analysis.clarifying_questions:
+            yield ("clarify", q)
+
+    # --- Step 3: Execute search strategy ---
+    if route_analysis.strategy == "hub_based" and route_analysis.connecting_hubs:
+        strategy = HubBasedSearchStrategy(amadeus, serpapi, route_analysis)
+    else:
+        strategy = DirectSearchStrategy(amadeus, serpapi)
+
     all_flights: list[FlightOption] = []
-    sources_used: list[str] = []
+    async for event_type, message, flights in strategy.execute(parsed_query):
+        if event_type == "done":
+            all_flights = flights
+        else:
+            yield (event_type, message)
 
-    # Always search Amadeus first
-    amadeus_results = await amadeus.search(parsed_query)
-    if amadeus_results:
-        all_flights.extend(amadeus_results)
-        sources_used.append("amadeus")
-        logger.info(f"Amadeus returned {len(amadeus_results)} results")
+    sources_used = list({f.source for f in all_flights})
 
-    # Search SerpAPI if Amadeus has few results or SerpAPI is available
-    if len(amadeus_results) < AMADEUS_MIN_RESULTS:
-        serpapi_results = await serpapi.search(parsed_query)
-        if serpapi_results:
-            all_flights.extend(serpapi_results)
-            sources_used.append("serpapi")
-            logger.info(f"SerpAPI returned {len(serpapi_results)} results")
-
+    # --- Step 4: Handle no results ---
     if not all_flights:
-        return SearchResponse(
+        no_result_msg = _build_no_results_message(parsed_query, route_analysis)
+        yield ("thinking", no_result_msg)
+        yield ("results", SearchResponse(
             session_id=session_id,
             parsed_query=parsed_query,
             results=[],
             sources_used=sources_used,
             search_duration_seconds=round(time.time() - start_time, 2),
             total_options_found=0,
-        )
+            route_analysis=route_analysis,
+        ).model_dump(mode="json"))
+        return
 
-    # --- Step 3: Deduplicate ---
+    # --- Step 5: Deduplicate ---
     all_flights = _deduplicate_flights(all_flights)
 
-    # --- Step 4: Rank with Claude ---
+    # --- Step 6: Rank with Claude ---
+    yield ("ranking", f"Found {len(all_flights)} options, ranking by your preferences...")
+
     flights_as_dicts = [f.model_dump() for f in all_flights]
 
     try:
@@ -105,13 +208,12 @@ async def search_flights(request: SearchRequest, token: str = Depends(require_au
         )
     except Exception as e:
         logger.error(f"Ranking failed: {e}")
-        # Fallback: sort by price
         rankings = [
             {"rank": i + 1, "flight_id": f.id, "explanation": "Sorted by price (AI ranking unavailable)", "tags": []}
             for i, f in enumerate(sorted(all_flights, key=lambda x: x.price_usd))
         ]
 
-    # --- Step 5: Build ranked results ---
+    # --- Step 7: Build ranked results ---
     flight_map = {f.id: f for f in all_flights}
     ranked_results = []
 
@@ -119,7 +221,6 @@ async def search_flights(request: SearchRequest, token: str = Depends(require_au
         flight_id = ranking.get("flight_id", "")
         flight = flight_map.get(flight_id)
         if not flight:
-            # Try to match by index if ID doesn't match
             idx = ranking.get("rank", 1) - 1
             if 0 <= idx < len(all_flights):
                 flight = all_flights[idx]
@@ -133,7 +234,7 @@ async def search_flights(request: SearchRequest, token: str = Depends(require_au
             tags=ranking.get("tags", []),
         ))
 
-    # --- Step 6: Save session ---
+    # --- Step 8: Save session ---
     conversation = [{"role": "user", "content": request.query}]
     await save_session(
         session_id=session_id,
@@ -145,15 +246,32 @@ async def search_flights(request: SearchRequest, token: str = Depends(require_au
     duration = round(time.time() - start_time, 2)
     logger.info(f"Search complete: {len(ranked_results)} results in {duration}s")
 
-    return SearchResponse(
+    yield ("results", SearchResponse(
         session_id=session_id,
         parsed_query=parsed_query,
         results=ranked_results,
         sources_used=sources_used,
         search_duration_seconds=duration,
         total_options_found=len(ranked_results),
-    )
+        route_analysis=route_analysis,
+    ).model_dump(mode="json"))
 
+
+def _build_no_results_message(query: ParsedQuery, analysis: RouteAnalysis) -> str:
+    """Explain what was tried when no flights are found."""
+    parts = [f"I couldn't find flights from {query.origin} to {query.destination} on {query.departure_date}."]
+
+    if analysis.strategy == "hub_based" and analysis.connecting_hubs:
+        hubs = ", ".join(analysis.connecting_hubs)
+        parts.append(f"I searched direct flights and connections via {hubs}.")
+    else:
+        parts.append("I searched all available providers.")
+
+    parts.append("Would you like me to try flexible dates or a different cabin class?")
+    return " ".join(parts)
+
+
+# --- Refine endpoint (unchanged from original) ---
 
 @search_router.post("/{session_id}/refine", response_model=RefineResponse)
 async def refine_search(
@@ -161,10 +279,7 @@ async def refine_search(
     request: RefineRequest,
     token: str = Depends(require_auth),
 ):
-    """
-    Refine an existing search conversationally.
-    Claude interprets the follow-up and decides whether a new search is needed.
-    """
+    """Refine an existing search conversationally."""
     session = await get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -172,7 +287,6 @@ async def refine_search(
     current_query = session.get("parsed_query", {})
     conversation = session.get("conversation_history", [])
 
-    # Ask Claude to interpret the refinement
     try:
         result = await claude_client.handle_refinement(
             conversation_history=conversation,
@@ -191,21 +305,17 @@ async def refine_search(
         message=result.get("message", ""),
     )
 
-    # If a new search is needed, run it
     if result.get("needs_new_search") and result.get("updated_query"):
         try:
             updated = ParsedQuery(**result["updated_query"])
             response.updated_query = updated
 
-            # Run the search pipeline with updated params
-            all_flights = await amadeus.search(updated)
-            sources = ["amadeus"] if all_flights else []
-
-            if len(all_flights) < AMADEUS_MIN_RESULTS:
-                serpapi_results = await serpapi.search(updated)
-                if serpapi_results:
-                    all_flights.extend(serpapi_results)
-                    sources.append("serpapi")
+            # Run search with updated params using direct strategy
+            strategy = DirectSearchStrategy(amadeus, serpapi)
+            all_flights = []
+            async for event_type, message, flights in strategy.execute(updated):
+                if event_type == "done":
+                    all_flights = flights
 
             if all_flights:
                 all_flights = _deduplicate_flights(all_flights)
@@ -235,7 +345,6 @@ async def refine_search(
             logger.error(f"Refined search failed: {e}")
             response.message += " (Search with updated params failed, showing previous results.)"
 
-    # Update conversation history
     conversation.append({"role": "user", "content": request.message})
     conversation.append({"role": "assistant", "content": result.get("message", "")})
     await save_session(session_id=session_id, conversation=conversation)
@@ -261,21 +370,15 @@ async def get_search_results(session_id: str, token: str = Depends(require_auth)
 
 
 def _deduplicate_flights(flights: list[FlightOption]) -> list[FlightOption]:
-    """
-    Remove duplicate flights across providers.
-    Two flights are considered duplicates if they have the same route segments
-    at similar times and similar prices.
-    """
+    """Remove duplicate flights across providers and search strategies."""
     seen = set()
     unique = []
 
     for flight in flights:
-        # Create a fingerprint from key attributes
         segments_key = tuple(
             (s.departure_airport, s.arrival_airport, s.airline_code, s.flight_number)
             for s in flight.segments
         )
-        # Round price to nearest $10 to catch minor price differences
         price_bucket = round(flight.price_usd / 10) * 10
         fingerprint = (segments_key, price_bucket)
 

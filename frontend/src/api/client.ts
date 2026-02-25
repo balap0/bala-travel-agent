@@ -1,4 +1,4 @@
-// API client — thin wrapper around fetch for backend communication
+// API client — fetch wrapper + SSE streaming for search pipeline
 
 const BASE_URL = '/api'
 
@@ -32,6 +32,125 @@ export async function apiCall<T>(endpoint: string, options: ApiOptions = {}): Pr
   return response.json()
 }
 
+// SSE event callback types
+export interface SSECallbacks {
+  onThinking?: (message: string) => void
+  onStrategy?: (message: string) => void
+  onClarify?: (question: string) => void
+  onSearching?: (message: string) => void
+  onRanking?: (message: string) => void
+  onResults?: (response: SearchResponse) => void
+  onError?: (error: string) => void
+}
+
+// SSE-based search — streams progress events during the search pipeline
+export function searchWithSSE(
+  query: string,
+  token: string,
+  callbacks: SSECallbacks,
+  sessionId?: string,
+): AbortController {
+  const controller = new AbortController()
+
+  const body = JSON.stringify({ query, session_id: sessionId })
+
+  fetch(`${BASE_URL}/search`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+      'Authorization': `Bearer ${token}`,
+    },
+    body,
+    signal: controller.signal,
+  }).then(async (response) => {
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ detail: 'Search failed' }))
+      callbacks.onError?.(err.detail || `HTTP ${response.status}`)
+      return
+    }
+
+    const reader = response.body?.getReader()
+    if (!reader) {
+      callbacks.onError?.('No response stream')
+      return
+    }
+
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let pendingEvent = ''
+    let pendingData = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      // Parse SSE events from buffer
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || '' // keep incomplete line in buffer
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          pendingEvent = line.slice(7).trim()
+        } else if (line.startsWith('data: ')) {
+          pendingData = line.slice(6)
+        } else if (line === '' && pendingEvent) {
+          // Empty line = event boundary, dispatch
+          _dispatchSSEEvent(pendingEvent, pendingData, callbacks)
+          pendingEvent = ''
+          pendingData = ''
+        }
+      }
+    }
+
+    // Handle any remaining event after stream ends
+    if (pendingEvent && pendingData) {
+      _dispatchSSEEvent(pendingEvent, pendingData, callbacks)
+    }
+  }).catch((err) => {
+    if (err.name !== 'AbortError') {
+      callbacks.onError?.(err instanceof Error ? err.message : 'Search failed')
+    }
+  })
+
+  return controller
+}
+
+function _dispatchSSEEvent(event: string, rawData: string, callbacks: SSECallbacks) {
+  try {
+    const data = JSON.parse(rawData)
+
+    switch (event) {
+      case 'thinking':
+        callbacks.onThinking?.(data)
+        break
+      case 'strategy':
+        callbacks.onStrategy?.(data)
+        break
+      case 'clarify':
+        callbacks.onClarify?.(data)
+        break
+      case 'searching':
+        callbacks.onSearching?.(data)
+        break
+      case 'ranking':
+        callbacks.onRanking?.(data)
+        break
+      case 'results':
+        callbacks.onResults?.(data as SearchResponse)
+        break
+      case 'error':
+        callbacks.onError?.(data)
+        break
+    }
+  } catch {
+    // If data isn't valid JSON, treat it as a plain string
+    if (event === 'error') callbacks.onError?.(rawData)
+  }
+}
+
 // Typed API methods
 export const api = {
   login: (password: string) =>
@@ -40,6 +159,7 @@ export const api = {
       body: { password },
     }),
 
+  // Fallback non-streaming search (if SSE fails)
   search: (query: string, token: string, sessionId?: string) =>
     apiCall<SearchResponse>('/search', {
       method: 'POST',
@@ -103,6 +223,16 @@ export interface ParsedQuery {
   clarification_needed?: string
 }
 
+export interface RouteAnalysis {
+  difficulty: string
+  strategy: string
+  connecting_hubs: string[]
+  recommended_airlines: string[]
+  destination_brief: string
+  clarifying_questions: string[]
+  reasoning: string
+}
+
 export interface SearchResponse {
   session_id: string
   parsed_query: ParsedQuery
@@ -110,6 +240,7 @@ export interface SearchResponse {
   sources_used: string[]
   search_duration_seconds: number
   total_options_found: number
+  route_analysis?: RouteAnalysis
 }
 
 export interface RefineResponse {
