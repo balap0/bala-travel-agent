@@ -85,9 +85,9 @@ export default function FlightCard({ result, onInteraction }: FlightCardProps) {
           <span className="font-medium">
             {flight.return_segments[flight.return_segments.length - 1]?.arrival_airport}
           </span>
-          {flight.return_duration_minutes > 0 && (
+          {(flight.return_duration_minutes ?? 0) > 0 && (
             <span className="text-gray-400 ml-2">
-              ({formatDuration(flight.return_duration_minutes)})
+              ({formatDuration(flight.return_duration_minutes ?? 0)})
             </span>
           )}
         </div>
