@@ -23,10 +23,12 @@ async def lifespan(app: FastAPI):
     yield
 
 
+APP_VERSION = "3.0.0"
+
 app = FastAPI(
     title="Bala Travel Agent",
     description="AI-powered personal travel planning API",
-    version="0.1.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -53,7 +55,7 @@ async def health_check():
     """Health check endpoint for Railway and monitoring."""
     return {
         "status": "healthy",
-        "version": "0.1.0",
+        "version": APP_VERSION,
         "environment": settings.environment,
     }
 

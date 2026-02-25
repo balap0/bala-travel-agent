@@ -12,6 +12,8 @@ interface SearchPageProps {
   onLogout: () => void
 }
 
+const APP_VERSION = '3.0.0'
+
 type AgentState = 'idle' | 'thinking' | 'waiting_for_input' | 'ready'
 
 let msgCounter = 0
@@ -148,7 +150,9 @@ export default function SearchPage({ token, onLogout }: SearchPageProps) {
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
       <header className="bg-white border-b px-4 py-3 flex items-center justify-between sticky top-0 z-10">
-        <h1 className="text-xl font-bold text-gray-900">Bala Travel Agent</h1>
+        <h1 className="text-xl font-bold text-gray-900">
+          Bala Travel Agent <span className="text-xs font-normal text-gray-400">v{APP_VERSION}</span>
+        </h1>
         <div className="flex items-center gap-4">
           <button
             onClick={() => setPrefsOpen(true)}
