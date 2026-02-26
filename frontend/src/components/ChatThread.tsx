@@ -40,7 +40,8 @@ const stepStyles: Record<string, { icon: string; borderColor: string; textColor:
 
 export default function ChatThread({ messages, agentState, onReplyToQuestion, onInteraction }: ChatThreadProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
-  const [replyText, setReplyText] = useState('')
+  // Per-question reply text — keyed by message ID so each input is independent
+  const [replyTexts, setReplyTexts] = useState<Record<string, string>>({})
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -49,10 +50,16 @@ export default function ChatThread({ messages, agentState, onReplyToQuestion, on
 
   if (messages.length === 0) return null
 
-  const handleReply = () => {
-    if (!replyText.trim()) return
-    onReplyToQuestion(replyText.trim())
-    setReplyText('')
+  const getReplyText = (msgId: string) => replyTexts[msgId] || ''
+  const setReplyText = (msgId: string, text: string) => {
+    setReplyTexts(prev => ({ ...prev, [msgId]: text }))
+  }
+
+  const handleReply = (msgId: string) => {
+    const text = getReplyText(msgId)
+    if (!text.trim()) return
+    onReplyToQuestion(text.trim())
+    setReplyTexts(prev => ({ ...prev, [msgId]: '' }))
   }
 
   return (
@@ -117,20 +124,20 @@ export default function ChatThread({ messages, agentState, onReplyToQuestion, on
                   </div>
                 </div>
               ) : agentState === 'waiting_for_input' ? (
-                // Show reply input
+                // Show reply input — each question has its own independent text state
                 <div className="ml-6 flex gap-2">
                   <input
                     type="text"
-                    value={replyText}
-                    onChange={(e) => setReplyText(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleReply()}
+                    value={getReplyText(msg.id)}
+                    onChange={(e) => setReplyText(msg.id, e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleReply(msg.id)}
                     placeholder="Type your answer..."
                     className="flex-1 border border-amber-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-transparent"
                     autoFocus
                   />
                   <button
-                    onClick={handleReply}
-                    disabled={!replyText.trim()}
+                    onClick={() => handleReply(msg.id)}
+                    disabled={!getReplyText(msg.id).trim()}
                     className="px-4 py-2 bg-amber-500 text-white text-sm font-medium rounded-lg hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition"
                   >
                     Reply
