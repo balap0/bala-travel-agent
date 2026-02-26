@@ -841,44 +841,65 @@ def _apply_hard_constraints(flights: list[FlightOption]) -> tuple[list[FlightOpt
                               "don't book", "exclude ", "not ", "without "]
         if any(kw in content_lower for kw in exclusion_keywords):
             before_count = len(filtered)
+            # Log which flights match for debugging
+            for f in filtered:
+                all_airlines = list(f.airline_names) + list(f.return_airline_names or [])
+                seg_airlines = [s.airline for s in f.segments] + [s.airline for s in (f.return_segments or [])]
+                matches = _flight_matches_airline_constraint(f, content_lower)
+                if matches:
+                    logger.info(f"Hard constraint MATCH: '{constraint['content']}' → removing flight with airlines {all_airlines}, segments {seg_airlines}")
             filtered = [f for f in filtered if not _flight_matches_airline_constraint(f, content_lower)]
             removed = before_count - len(filtered)
             if removed > 0:
                 messages.append(f"Removed {removed} options matching your rule: \"{constraint['content']}\"")
+            else:
+                logger.info(f"Hard constraint '{constraint['content']}' matched 0 of {before_count} flights. Airlines in results: {[list(f.airline_names) + list(f.return_airline_names or []) for f in filtered]}")
 
     return filtered, messages
 
 
 def _flight_matches_airline_constraint(flight: FlightOption, constraint_lower: str) -> bool:
-    """Check if any airline in the flight (name or segment) matches an exclusion constraint.
+    """Check if any airline in the flight matches an exclusion constraint.
 
-    Uses bidirectional substring matching:
-    - "air india" in "never fly air india" (airline name found in constraint)
-    - Checks both airline_names list and individual segment airlines
+    Checks ALL legs (outbound + return) and uses bidirectional substring matching
+    with fuzzy suffix stripping (e.g., "air india" matches "air india express").
     """
-    # Check the airline_names list (e.g., ["ETHIOPIAN AIRLINES", "AIR INDIA"])
-    for name in flight.airline_names:
-        name_lower = name.lower()
-        # Airline name appears in constraint text
+    def _name_matches(name_lower: str) -> bool:
+        """Check if an airline name matches the constraint text."""
+        if not name_lower:
+            return False
+        # Direct substring: "air india" in "never fly air india"
         if name_lower in constraint_lower:
             return True
-        # Also check without common suffixes for fuzzy matching
-        for suffix in [" airlines", " airways", " air"]:
+        # Constraint name in airline: constraint has "air india", airline is "air india express"
+        # Extract the airline-like words from the constraint
+        # Fuzzy: strip common suffixes and check again
+        for suffix in [" airlines", " airways", " air", " express", " limited"]:
             if name_lower.endswith(suffix):
                 base = name_lower[:-len(suffix)].strip()
                 if len(base) > 2 and base in constraint_lower:
                     return True
+        return False
 
-    # Check individual segments (codeshare legs might not be in airline_names)
-    for seg in flight.segments:
-        seg_airline = seg.airline.lower()
-        if seg_airline in constraint_lower:
+    # Check outbound airline names (e.g., ["ETHIOPIAN AIRLINES", "AIR INDIA"])
+    for name in flight.airline_names:
+        if _name_matches(name.lower()):
             return True
-        for suffix in [" airlines", " airways", " air"]:
-            if seg_airline.endswith(suffix):
-                base = seg_airline[:-len(suffix)].strip()
-                if len(base) > 2 and base in constraint_lower:
-                    return True
+
+    # Check return airline names (round-trip return legs)
+    for name in (flight.return_airline_names or []):
+        if _name_matches(name.lower()):
+            return True
+
+    # Check individual outbound segments (codeshare legs might not be in airline_names)
+    for seg in flight.segments:
+        if _name_matches(seg.airline.lower()):
+            return True
+
+    # Check individual return segments
+    for seg in (flight.return_segments or []):
+        if _name_matches(seg.airline.lower()):
+            return True
 
     return False
 
@@ -893,8 +914,13 @@ def _deduplicate_flights(flights: list[FlightOption]) -> list[FlightOption]:
             (s.departure_airport, s.arrival_airport, s.airline_code, s.flight_number)
             for s in flight.segments
         )
+        # Include return segments in fingerprint for round-trip dedup
+        return_key = tuple(
+            (s.departure_airport, s.arrival_airport, s.airline_code, s.flight_number)
+            for s in (flight.return_segments or [])
+        )
         price_bucket = round(flight.price_usd / 10) * 10
-        fingerprint = (segments_key, price_bucket)
+        fingerprint = (segments_key, return_key, price_bucket)
 
         if fingerprint not in seen:
             seen.add(fingerprint)
